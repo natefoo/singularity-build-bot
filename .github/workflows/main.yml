@@ -6,6 +6,13 @@ on:
       - master
   schedule:
     - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      full_sync:
+        description: "Full comparison (ignore recent-days filter)"
+        required: false
+        type: boolean
+        default: false
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,7 +40,11 @@ jobs:
           python -m pip install --requirement requirements.in
       - name: Fetch images and generate build script
         run: |
-          ./populate_build.py
+          if [ "${{ github.event.inputs.full_sync }}" = "true" ]; then
+            ./populate_build.py --recent-days 0
+          else
+            ./populate_build.py
+          fi
       - name: Set up Singularity ${{ matrix.singularity-version }}
         uses: eWaterCycle/setup-singularity@v7
         with:
