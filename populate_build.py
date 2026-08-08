@@ -6,6 +6,7 @@
 import argparse
 import asyncio
 import logging
+import time
 from enum import Enum
 from functools import partial
 from html.parser import HTMLParser
@@ -47,6 +48,7 @@ class Repository(pydantic.BaseModel):
     is_public: bool
     kind: RepositoryKind
     state: RepositoryState
+    last_modified: Optional[int] = None
 
 
 class RepositoryListResponse(pydantic.BaseModel):
@@ -96,8 +98,15 @@ class QuayImageFetcher:
         params: Optional[Dict[str, str]] = None,
         headers: Optional[Dict[str, str]] = None,
         log_file: Path = Path(".quay.log"),
+        recent_days: int = 0,
     ) -> List[str]:
-        """Fetch all container images and their tags."""
+        """Fetch container images and their tags.
+
+        If *recent_days* is greater than zero, only repositories whose
+        ``last_modified`` timestamp falls within the last *recent_days* days
+        are considered.  A value of zero means: fetch all repositories
+        (full comparison).
+        """
         if headers is None:
             headers = {
                 "Accept-Encoding": "gzip",
@@ -107,6 +116,7 @@ class QuayImageFetcher:
         if params is None:
             params = {"public": "true", "repo_kind": "image"}
         params["namespace"] = repository
+        params["last_modified"] = "true"
         async with httpx.AsyncClient(
             base_url=api_url, headers=headers, timeout=httpx.Timeout(12)
         ) as api_client, httpx.AsyncClient(
@@ -114,7 +124,9 @@ class QuayImageFetcher:
             headers=headers,
             timeout=httpx.Timeout(12),
         ) as registry_client:
-            names = await cls._fetch_names(client=api_client, params=params)
+            names = await cls._fetch_names(
+                client=api_client, params=params, recent_days=recent_days
+            )
             images = await cls._fetch_tags(
                 client=registry_client, repository=repository, names=names
             )
@@ -138,21 +150,37 @@ class QuayImageFetcher:
 
     @classmethod
     async def _fetch_names(
-        cls, client: httpx.AsyncClient, params: Dict[str, str]
+        cls, client: httpx.AsyncClient, params: Dict[str, str], recent_days: int = 0
     ) -> List[str]:
-        """Fetch one or more batches of container images."""
+        """Fetch one or more batches of container image names.
+
+        When *recent_days* is greater than zero, only repositories touched
+        within that many days are returned.
+        """
         names = []
+        cutoff = time.time() - recent_days * 86400 if recent_days else 0
         with cls._progress_spinner() as pbar:
             task = pbar.add_task(description="Image Batch")
             repos = await cls._fetch_repository_list(client=client, params=params)
-            names.extend((repo.name for repo in repos.repositories))
+            names.extend(
+                repo.name for repo in repos.repositories
+                if not cutoff or (repo.last_modified or 0) >= cutoff
+            )
             pbar.update(task, advance=1)
             while repos.next_page:
                 repos = await cls._fetch_repository_list(
                     client=client, params={**params, "next_page": repos.next_page}
                 )
-                names.extend((repo.name for repo in repos.repositories))
+                names.extend(
+                    repo.name for repo in repos.repositories
+                    if not cutoff or (repo.last_modified or 0) >= cutoff
+                )
                 pbar.update(task, advance=1)
+        if cutoff:
+            logger.info(
+                f"Filtered to {len(names):,} repositories touched in the "
+                f"last {recent_days} days."
+            )
         return names
 
     @classmethod
@@ -180,7 +208,7 @@ class QuayImageFetcher:
         """Fetch a list of repositories and parse the response."""
         response = await client.get("repository", params=params)
         response.raise_for_status()
-        return RepositoryListResponse.parse_obj(response.json())
+        return RepositoryListResponse.model_validate(response.json())
 
     @classmethod
     async def _fetch_tags(
@@ -243,7 +271,7 @@ class QuayImageFetcher:
         while next_url:
             response = await client.get(next_url, params=params)
             response.raise_for_status()
-            payload = TagListResponse.parse_obj(response.json())
+            payload = TagListResponse.model_validate(response.json())
             images.extend((f"{name}:{tag}" for tag in payload.tags))
             next_link = response.links.get("next")
             next_url = QuayImageFetcher._normalize_next_link(client, next_link["url"]) if next_link else ""
@@ -275,7 +303,7 @@ class SingularityImageFetcher:
                 "User-Agent": "singularity-build-bot",
             }
         images = []
-        with httpx.Client(headers=headers) as client:
+        with httpx.Client(headers=headers, timeout=httpx.Timeout(120)) as client:
             for url in urls:
                 parser = ContainerImageParser()
                 if response := cls._fetch_images(client=client, url=url):
@@ -405,6 +433,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"),
         default=default_log_level,
     )
+    parser.add_argument(
+        "--recent-days",
+        metavar="N",
+        type=int,
+        default=14,
+        help="Only consider Quay repositories touched within the last N days "
+        "(default 14). Set to 0 for a full comparison of all repositories.",
+    )
     return parser.parse_args(argv)
 
 
@@ -420,8 +456,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     assert args.denylist.is_file(), f"File not found '{args.denylist}'."
     assert args.build_script.is_file(), f"File not found '{args.build_script}'."
     args.build_script.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Fetching quay.io BioContainers images.")
-    quay_images = asyncio.run(QuayImageFetcher.fetch_all(api_url=args.quay_api))
+    if args.recent_days:
+        logger.info(
+            f"Fetching quay.io BioContainers images (recent mode: last "
+            f"{args.recent_days} days)."
+        )
+    else:
+        logger.info("Fetching quay.io BioContainers images (full comparison).")
+    quay_images = asyncio.run(
+        QuayImageFetcher.fetch_all(
+            api_url=args.quay_api, recent_days=args.recent_days
+        )
+    )
     logger.info(f"Found {len(quay_images):,} images with tags.")
     logger.info("Fetching Singularity BioContainers images.")
     singularity_images = SingularityImageFetcher.fetch_all(
